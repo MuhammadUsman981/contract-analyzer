@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: contract-analyzer
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PYTHONPATH
+        value: /app
+      - key: HF_TOKEN
+        sync: false
+      - key: WANDB_API_KEY
+        sync: false
+    healthCheckPath: /health
