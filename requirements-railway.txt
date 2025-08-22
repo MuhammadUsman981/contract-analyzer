@@ -1,0 +1,10 @@
+# Lightweight packages for Railway deployment (no heavy ML packages)
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-multipart==0.0.6
+aiofiles==23.2.0
+python-dotenv==1.0.0
+requests==2.31.0
+psutil==5.9.5
+Jinja2==3.1.2

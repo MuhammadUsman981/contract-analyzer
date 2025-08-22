@@ -11,24 +11,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PIP_PREFER_BINARY=1
 ENV PYTHONPATH=/app
 
-# Install only essential packages to reduce memory usage
+# Copy Railway-specific requirements
+COPY requirements-railway.txt .
+
+# Install lightweight packages
 RUN pip install --upgrade pip && \
-    pip install fastapi==0.104.1 \
-    uvicorn[standard]==0.24.0 \
-    python-dotenv==1.0.0 \
-    aiofiles==23.2.0 \
-    python-multipart==0.0.6 \
-    requests==2.31.0
+    pip install -r requirements-railway.txt
 
 # Copy application code
 COPY backend ./backend
 COPY configs ./configs
 
-# Create a minimal app for demo
-RUN echo 'from fastapi import FastAPI\nfrom fastapi.responses import JSONResponse\nimport datetime\n\napp = FastAPI(title="Contract Analyzer", description="AI-powered legal document analysis")\n\n@app.get("/")\nasync def root():\n    return {"message": "Contract Analyzer API", "status": "running", "timestamp": datetime.datetime.now()}\n\n@app.get("/health")\nasync def health():\n    return {"status": "healthy", "timestamp": datetime.datetime.now()}\n\n@app.post("/analyze")\nasync def analyze_contract():\n    return {"message": "Contract analysis feature coming soon", "status": "demo_mode"}\n\nif __name__ == "__main__":\n    import uvicorn\n    uvicorn.run(app, host="0.0.0.0", port=8000)' > backend/minimal_app.py
+# Create a lightweight demo app for Railway
+RUN echo 'from fastapi import FastAPI\nfrom fastapi.responses import JSONResponse\nimport datetime\nimport os\n\napp = FastAPI(\n    title="Contract Analyzer API",\n    description="AI-powered legal document analysis",\n    version="1.0.0"\n)\n\n@app.get("/")\nasync def root():\n    return {\n        "message": "Contract Analyzer API",\n        "status": "running",\n        "version": "1.0.0",\n        "timestamp": datetime.datetime.now().isoformat(),\n        "endpoints": {\n            "health": "/health",\n            "docs": "/docs",\n            "analyze": "/analyze"\n        }\n    }\n\n@app.get("/health")\nasync def health():\n    return {\n        "status": "healthy",\n        "timestamp": datetime.datetime.now().isoformat(),\n        "service": "contract-analyzer",\n        "environment": "production",\n        "memory_usage": "optimized"\n    }\n\n@app.post("/analyze")\nasync def analyze_contract():\n    return {\n        "message": "Contract analysis endpoint",\n        "status": "demo_mode",\n        "note": "This is a lightweight deployment. Full ML analysis available in development environment.",\n        "timestamp": datetime.datetime.now().isoformat(),\n        "demo_features": [\n            "API structure demonstration",\n            "Health monitoring",\n            "Documentation generation",\n            "Production-ready deployment"\n        ]\n    }\n\nif __name__ == "__main__":\n    import uvicorn\n    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))' > backend/railway_app.py
 
 # Expose port
 EXPOSE 8000
 
-# Start the minimal application
-CMD uvicorn backend.minimal_app:app --host 0.0.0.0 --port ${PORT:-8000}
+# Start the lightweight application
+CMD uvicorn backend.railway_app:app --host 0.0.0.0 --port ${PORT:-8000}
