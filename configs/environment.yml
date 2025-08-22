@@ -1,0 +1,37 @@
+name: contract-analyzer
+channels:
+  - conda-forge
+dependencies:
+  # Core
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - psutil
+  - rich
+
+  # API
+  - fastapi
+  - uvicorn
+  - pydantic
+  - python-multipart
+  - pypdf2
+
+  # ML / LLM
+  - pytorch-cpu        # ✅ CPU-only torch from conda-forge
+  - transformers
+  - accelerate
+  - sentence-transformers
+  - faiss-cpu
+  - datasets
+  - evaluate
+  - spacy
+
+  # Experiment tracking
+  - wandb
+
+  # pip extras
+  - pip:
+      - uvicorn[standard]
+      # Install the small English spaCy model at environment creation
+      - https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1.tar.gz

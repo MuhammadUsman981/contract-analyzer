@@ -1,0 +1,26 @@
+# Core
+numpy
+pandas
+psutil
+rich
+
+# API
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+pypdf2
+
+# ML / LLM
+torch         # CPU‑only; will grab latest stable from PyPI
+transformers
+accelerate
+sentence-transformers
+faiss-cpu
+datasets
+evaluate
+spacy
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1.tar.gz
+
+# Experiment tracking
+wandb
