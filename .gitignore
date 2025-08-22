@@ -55,6 +55,14 @@ models/
 *.bin
 *.safetensors
 
+# ML experiment tracking (wandb logs)
+wandb/
+backend/wandb/
+
+# Data files (large datasets)
+data/
+!data/.gitkeep
+
 # Environment variables
 .env
 *.env
@@ -73,3 +81,6 @@ tmp/
 temp/
 *.tmp
 *.temp
+
+# Docker
+.dockerignore
