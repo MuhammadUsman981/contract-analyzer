@@ -16,7 +16,6 @@ parts/
 sdist/
 var/
 wheels/
-share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -27,41 +26,64 @@ venv/
 venv-local/
 env/
 ENV/
+env.bak/
+venv.bak/
 
-# Environment variables
-.env
-configs/.env
-
-# Model cache
-model_cache/
-*.pkl
-*.bin
-*.safetensors
-
-# Data files
-data/*.json
-data/*.csv
-data/legal_knowledge_base/
-
-# IDE
+# IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
 # Logs
 *.log
 logs/
 
-# Docker
-.dockerignore
+# Model cache
+model_cache/
+models/
+*.bin
+*.safetensors
 
-# Wandb
-wandb/
+# Data files (keep structure, ignore large files)
+data/*.json
+data/*.csv
+data/*.parquet
+
+# Environment variables (keep example, ignore actual)
+.env
+*.env
+!.env.example
 
 # Jupyter
 .ipynb_checkpoints/
+*.ipynb
+
+# Cache
+.cache/
+.pytest_cache/
+
+# Docker
+.dockerignore
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Requirements variations (keep only essential ones)
+requirements-*.txt
+!requirements.txt
+!requirements-streamlit.txt
+!requirements-railway.txt
