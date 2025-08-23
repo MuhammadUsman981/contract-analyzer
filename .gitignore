@@ -84,3 +84,13 @@ temp/
 
 # Docker
 .dockerignore
+# Prevent secret leaks
+configs/.env
+configs/.env.local
+# Environment files with secrets
+.env
+.env.*
+!.env.example
+configs/.env
+configs/.env.*
+!configs/.env.example
