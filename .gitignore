@@ -55,18 +55,21 @@ models/
 *.bin
 *.safetensors
 
-# ML experiment tracking (wandb logs)
+# ML experiment tracking
 wandb/
 backend/wandb/
+
+# Environment variables and secrets
+.env
+*.env
+!.env.example
+configs/.env
+configs/.env.*
+!configs/.env.example
 
 # Data files (large datasets)
 data/
 !data/.gitkeep
-
-# Environment variables
-.env
-*.env
-!.env.example
 
 # Jupyter
 .ipynb_checkpoints/
@@ -76,21 +79,14 @@ data/
 .cache/
 .pytest_cache/
 
+# Docker
+.dockerignore
+
 # Temporary files
 tmp/
 temp/
 *.tmp
 *.temp
 
-# Docker
-.dockerignore
-# Prevent secret leaks
-configs/.env
-configs/.env.local
-# Environment files with secrets
-.env
-.env.*
-!.env.example
-configs/.env
-configs/.env.*
-!configs/.env.example
+# Git working files
+repo-mirror.git/
