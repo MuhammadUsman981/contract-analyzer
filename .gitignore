@@ -90,3 +90,4 @@ temp/
 
 # Git working files
 repo-mirror.git/
+requirements/

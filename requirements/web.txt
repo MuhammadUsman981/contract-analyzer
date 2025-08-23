@@ -1,4 +1,0 @@
-# Web UI dependencies
-streamlit==1.28.1
-plotly==5.17.0
-altair==5.1.2
