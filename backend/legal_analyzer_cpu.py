@@ -1,46 +1,48 @@
 #!/usr/bin/env python3
 """
 CPU-Safe Legal Analyzer (RAG) — single-file core module
-
-Exposes:
-- CPUConfig
-- init_wandb_from_env
-- SystemMonitor
-- CPUSafeLegalKnowledgeBase
-- CPUSafeRAGLegalAnalyzer
-
-Designed to work with:
-- legal_analyzer_cli.py (build-kb / analyze / config)
-- your FastAPI app (imports these same classes)
 """
 
 from __future__ import annotations
-
-import os
-import re
-import io
-import json
-import time
-import math
-import logging
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+import os
+import sys
+import json
+import time
+import logging
+import warnings
+import re
+import io
 
+# Scientific computing
 import numpy as np
 
-# --- Third-party libs (all CPU-friendly) ---
-import psutil
+# ML Libraries
 import faiss  # faiss-cpu
 from sentence_transformers import SentenceTransformer
-from transformers import pipeline
-import wandb
+
+# System monitoring
+import psutil
+
+# W&B (optional)
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+# PyPDF2 for PDF handling
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
 
 # Torch is optional, only to tune CPU threading if present
 try:
     import torch
-except Exception:  # pragma: no cover
+    torch.set_num_threads(max(1, os.cpu_count() or 1))
+except Exception:
     torch = None
 
 # ---------------- Logging & Warnings ----------------
@@ -54,25 +56,18 @@ warnings.filterwarnings("ignore")
 # ====================================================
 @dataclass
 class CPUConfig:
-    MODEL_NAME: str = os.getenv("MODEL_NAME", "all-MiniLM-L6-v2")
-    MAX_LENGTH: int = int(os.getenv("MAX_LENGTH", "512"))
-    BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "64"))
-    OMP_NUM_THREADS: int = int(os.getenv("OMP_NUM_THREADS", str(max(1, os.cpu_count() or 1))))
-    LEARNING_RATE: float = float(os.getenv("LEARNING_RATE", "2e-5"))
-    EPOCHS: int = int(os.getenv("EPOCHS", "1"))
-
+    MODEL_NAME: str = "all-MiniLM-L6-v2"
+    MAX_LENGTH: int = 512
+    BATCH_SIZE: int = 8
+    OMP_NUM_THREADS: int = max(1, os.cpu_count() or 1)
+    
     @staticmethod
-    def set_cpu_optimizations() -> None:
-        # Environment knobs for BLAS/OpenMP backends
-        os.environ.setdefault("OMP_NUM_THREADS", str(CPUConfig.OMP_NUM_THREADS))
-        os.environ.setdefault("MKL_NUM_THREADS", str(CPUConfig.OMP_NUM_THREADS))
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", str(CPUConfig.OMP_NUM_THREADS))
-        os.environ.setdefault("NUMEXPR_NUM_THREADS", str(CPUConfig.OMP_NUM_THREADS))
-        if torch is not None:
-            try:
-                torch.set_num_threads(CPUConfig.OMP_NUM_THREADS)
-            except Exception:
-                pass
+    def set_cpu_optimizations():
+        """Set CPU optimization environment variables"""
+        os.environ["OMP_NUM_THREADS"] = str(CPUConfig.OMP_NUM_THREADS)
+        os.environ["MKL_NUM_THREADS"] = str(CPUConfig.OMP_NUM_THREADS)
+        os.environ["NUMEXPR_NUM_THREADS"] = str(CPUConfig.OMP_NUM_THREADS)
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 CPUConfig.set_cpu_optimizations()
@@ -82,22 +77,16 @@ CPUConfig.set_cpu_optimizations()
 # W&B helper
 # ====================================================
 def init_wandb_from_env(default_project: str = "legal-analyzer") -> None:
-    """
-    Initialize W&B if WANDB_API_KEY present. Respects WANDB_MODE=offline.
-    Safe to call multiple times.
-    """
-    if os.environ.get("WANDB_DISABLED", "").lower() == "true":
+    """Initialize W&B if WANDB_API_KEY present"""
+    if wandb is None or os.environ.get("WANDB_DISABLED", "").lower() == "true":
         return
+    
     mode = os.getenv("WANDB_MODE", "online")
     project = os.getenv("WANDB_PROJECT", default_project)
     try:
-        # If already initialized, do nothing
-        if wandb.run is not None:
-            return
         wandb.init(project=project, mode=mode)
-        logger.info(f"W&B initialized: project={project}, mode={mode}")
     except Exception as e:
-        logger.warning(f"W&B init skipped: {e}")
+        logger.warning(f"W&B init failed: {e}")
 
 
 # ====================================================
@@ -106,473 +95,534 @@ def init_wandb_from_env(default_project: str = "legal-analyzer") -> None:
 class SystemMonitor:
     def __init__(self, interval_sec: float = 5.0):
         self.interval_sec = interval_sec
-        self.monitoring = False
+        self.running = False
 
     def start(self) -> None:
-        self.monitoring = True
+        self.running = True
+        logger.info("System monitor started")
 
     def stop(self) -> None:
-        self.monitoring = False
+        self.running = False
+        logger.info("System monitor stopped")
 
     def log_once(self, prefix: str = "system/") -> None:
         try:
-            mem = psutil.virtual_memory()
-            cpu = psutil.cpu_percent(interval=None)
-            if wandb.run:
-                wandb.log(
-                    {
-                        f"{prefix}cpu_percent": cpu,
-                        f"{prefix}memory_percent": mem.percent,
-                        f"{prefix}memory_used_gb": mem.used / (1024 ** 3),
-                        f"{prefix}memory_available_gb": mem.available / (1024 ** 3),
-                    }
-                )
-        except Exception:
-            pass
+            memory = psutil.virtual_memory()
+            logger.info(f"CPU: {psutil.cpu_percent()}%, Memory: {memory.percent}%")
+        except Exception as e:
+            logger.warning(f"Monitor failed: {e}")
 
 
 # ====================================================
 # Knowledge Base Builder
 # ====================================================
 class CPUSafeLegalKnowledgeBase:
-    """
-    Builds & caches a CPU-friendly KB:
-      - knowledge_entries.json (list of small dicts)
-      - embeddings.npy
-      - faiss.index
-
-    Typical flow:
-      kb = CPUSafeLegalKnowledgeBase(model_name=...)
-      kb.build_vector_embeddings(texts)
-      kb.create_faiss_index()
-      kb.save_cache(output_dir)
-
-    Later for loading (handled automatically by analyzer):
-      CPUSafeLegalKnowledgeBase.load_cache(dir)
-    """
+    """Builds & caches a CPU-friendly KB"""
 
     def __init__(self, model_name: str = CPUConfig.MODEL_NAME):
         self.model_name = model_name
-        self.model = SentenceTransformer(self.model_name, device="cpu")
-        self.knowledge_entries: List[Dict[str, Any]] = []
-        self.embeddings: Optional[np.ndarray] = None
-        self.faiss_index: Optional[faiss.Index] = None
+        self.model = None
+        self.knowledge_entries = []
+        self.embeddings = None
+        self.faiss_index = None
 
-    # ---------- Build ----------
     def build_vector_embeddings(self, texts: List[str]) -> np.ndarray:
-        """
-        Build embeddings for given texts and populate knowledge_entries 1-to-1.
-        """
-        if not texts:
-            raise ValueError("No texts provided for embeddings.")
-
-        t0 = time.time()
-        logger.info(f"Encoding {len(texts)} texts on CPU...")
-
-        # Encode in batches (SentenceTransformer handles batching internally)
-        embeddings = self.model.encode(
-            texts,
-            batch_size=min(CPUConfig.BATCH_SIZE, 256),
-            show_progress_bar=True,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-        ).astype("float32")
-
-        self.embeddings = embeddings
-        # Create slim entries referencing the original text
-        self.knowledge_entries = [{"id": i, "text": texts[i]} for i in range(len(texts))]
-
-        logger.info(f"Embeddings shape: {embeddings.shape}; took {time.time() - t0:.2f}s")
-        if wandb.run:
-            wandb.log(
-                {
-                    "embedding/final_shape": str(embeddings.shape),
-                    "embedding/total_time": time.time() - t0,
-                }
-            )
-        return embeddings
+        """Build embeddings for texts"""
+        if self.model is None:
+            self.model = SentenceTransformer(self.model_name, device="cpu")
+        
+        embeddings = self.model.encode(texts, normalize_embeddings=True)
+        self.embeddings = embeddings.astype("float32")
+        return self.embeddings
 
     def create_faiss_index(self) -> faiss.Index:
-        """
-        Create an Inner Product (cosine with normalized vectors) index.
-        """
-        if self.embeddings is None or self.embeddings.size == 0:
-            raise ValueError("No embeddings available; call build_vector_embeddings first.")
-        dim = int(self.embeddings.shape[1])
-        index = faiss.IndexFlatIP(dim)
-        index.add(self.embeddings)
-        self.faiss_index = index
-        logger.info(f"FAISS index created with {self.embeddings.shape[0]} vectors.")
-        return index
-
-    # ---------- Cache ----------
-    def save_cache(self, output_dir: Union[str, Path]) -> None:
-        """
-        Writes knowledge_entries.json, embeddings.npy, faiss.index
-        """
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-
-        if self.knowledge_entries is None:
-            self.knowledge_entries = []
-
-        with open(out / "knowledge_entries.json", "w", encoding="utf-8") as f:
-            json.dump(self.knowledge_entries, f, ensure_ascii=False, indent=2)
-
+        """Create FAISS index"""
         if self.embeddings is None:
-            raise ValueError("embeddings is None; cannot save cache")
-        np.save(out / "embeddings.npy", self.embeddings)
+            raise ValueError("No embeddings available")
+        
+        dimension = self.embeddings.shape[1]
+        self.faiss_index = faiss.IndexFlatIP(dimension)
+        self.faiss_index.add(self.embeddings)
+        return self.faiss_index
 
-        if self.faiss_index is None:
-            raise ValueError("faiss_index is None; cannot save cache")
-        faiss.write_index(self.faiss_index, str(out / "faiss.index"))
+    def save_cache(self, output_dir: Union[str, Path]) -> None:
+        """Save cache to disk"""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
+        
+        # Save knowledge entries
+        with open(output_dir / "knowledge_entries.json", "w") as f:
+            json.dump(self.knowledge_entries, f)
+        
+        # Save embeddings
+        np.save(output_dir / "embeddings.npy", self.embeddings)
+        
+        # Save FAISS index
+        faiss.write_index(self.faiss_index, str(output_dir / "faiss.index"))
 
     @staticmethod
-    def load_cache(kb_dir: Union[str, Path]) -> Tuple[List[Dict[str, Any]], np.ndarray, faiss.Index]:
-        """
-        Load KB cache artifacts from a directory.
-        """
-        kb_path = Path(kb_dir)
-        entries_p = kb_path / "knowledge_entries.json"
-        emb_p = kb_path / "embeddings.npy"
-        faiss_p = kb_path / "faiss.index"
-
-        if not (entries_p.exists() and emb_p.exists() and faiss_p.exists()):
-            raise FileNotFoundError(f"KB cache not found or incomplete at: {kb_path}")
-
-        with open(entries_p, "r", encoding="utf-8") as f:
-            entries = json.load(f)
-        embeddings = np.load(emb_p).astype("float32")
-        index = faiss.read_index(str(faiss_p))
-
-        if len(entries) != embeddings.shape[0]:
-            logger.warning(
-                f"KB mismatch: entries={len(entries)} vs embeddings={embeddings.shape[0]}. "
-                f"Proceeding, but retrieval results may not align perfectly."
-            )
-
-        return entries, embeddings, index
+    def load_cache(cache_dir: Union[str, Path]) -> Tuple[List[Dict], np.ndarray, faiss.Index]:
+        """Load cached knowledge base"""
+        cache_dir = Path(cache_dir)
+        
+        # Load knowledge entries
+        with open(cache_dir / "knowledge_entries.json", "r") as f:
+            knowledge_entries = json.load(f)
+        
+        # Load embeddings
+        embeddings = np.load(cache_dir / "embeddings.npy")
+        
+        # Load FAISS index
+        faiss_index = faiss.read_index(str(cache_dir / "faiss.index"))
+        
+        return knowledge_entries, embeddings, faiss_index
 
 
 # ====================================================
-# RAG Analyzer (loads KB; retrieval + light heuristics)
+# RAG Analyzer
 # ====================================================
 class CPUSafeRAGLegalAnalyzer:
-    """
-    Loads a saved KB and performs retrieval + simple clause tagging + NER.
-
-    Expected KB layout at knowledge_base_path:
-      - knowledge_entries.json
-      - embeddings.npy
-      - faiss.index
-    """
-
+    """Enhanced RAG Legal Analyzer with improved clause detection"""
+    
+    # Updated clause patterns with better keywords and more realistic patterns
     CLAUSE_PATTERNS: Dict[str, Dict[str, Any]] = {
+        "Payment": {
+            "keywords": ["payment", "pay", "invoice", "fee", "cost", "amount", "due", "net", "days"],
+            "base_risk": "MEDIUM",
+            "risk_factors": {
+                "late_fees": ["late fee", "interest", "penalty", "overdue"],
+                "payment_terms": ["net 30", "net 60", "net 90", "immediate", "upon receipt"],
+                "penalties": ["penalty", "fine", "charge"]
+            }
+        },
         "Termination": {
-            "keywords": ["terminate", "termination", "notice period", "for cause", "for convenience"],
-            "base_risk": "HIGH",
+            "keywords": ["terminate", "termination", "end", "expire", "cancel", "notice", "breach"],
+            "base_risk": "HIGH", 
             "risk_factors": {
                 "immediate_termination": ["immediate", "without notice", "at will"],
                 "penalty_terms": ["penalty", "liquidated damages", "forfeit"],
                 "notice_period": ["30 days", "notice period", "reasonable notice"]
             }
         },
-        "Confidentiality": {
-            "keywords": ["confidential", "non-disclosure", "nda", "proprietary"],
-            "base_risk": "MEDIUM",
-            "risk_factors": {
-                "broad_scope": ["all information", "any information", "perpetual"],
-                "penalties": ["injunctive relief", "monetary damages", "specific performance"]
-            }
-        },
         "Liability": {
-            "keywords": ["liability", "indemnif", "hold harmless", "limitation of liability"],
+            "keywords": ["liable", "liability", "responsible", "damages", "loss", "harm", "indemnify"],
             "base_risk": "HIGH",
             "risk_factors": {
                 "unlimited_liability": ["unlimited", "no limitation", "full liability"],
-                "exclusions": ["consequential damages", "indirect damages", "punitive"],
-                "caps": ["limited to", "shall not exceed", "maximum liability"]
+                "exclusions": ["consequential", "indirect", "punitive"],
+                "caps": ["limited to", "shall not exceed", "maximum"]
+            }
+        },
+        "Confidentiality": {
+            "keywords": ["confidential", "proprietary", "secret", "disclose", "non-disclosure"],
+            "base_risk": "MEDIUM",
+            "risk_factors": {
+                "broad_scope": ["all information", "any information", "perpetual"],
+                "penalties": ["injunctive relief", "monetary damages"]
+            }
+        },
+        "Intellectual Property": {
+            "keywords": ["intellectual property", "copyright", "patent", "trademark", "license", "ownership"],
+            "base_risk": "HIGH",
+            "risk_factors": {
+                "broad_assignment": ["all rights", "work for hire", "assign"],
+                "licensing_terms": ["exclusive", "perpetual", "irrevocable"]
             }
         },
         "Governing Law": {
-            "keywords": ["governing law", "jurisdiction", "venue"],
+            "keywords": ["governing law", "jurisdiction", "court", "venue", "disputes"],
             "base_risk": "LOW",
             "risk_factors": {
-                "foreign_jurisdiction": ["foreign", "international", "arbitration"],
+                "foreign_jurisdiction": ["foreign", "international"],
                 "exclusive_venue": ["exclusive jurisdiction", "sole venue"]
-            }
-        },
-        "Payment": {
-            "keywords": ["payment", "invoice", "fees", "compensation", "net terms"],
-            "base_risk": "MEDIUM",
-            "risk_factors": {
-                "late_fees": ["late fee", "interest", "penalty"],
-                "payment_terms": ["net 30", "net 60", "net 90", "immediate"],
-                "currency_risk": ["foreign currency", "exchange rate"]
-            }
-        },
-        "IP": {
-            "keywords": ["intellectual property", "license", "licence", "ownership", "assign", "patent", "trademark"],
-            "base_risk": "HIGH",
-            "risk_factors": {
-                "broad_assignment": ["all rights", "work for hire", "assign all"],
-                "licensing_terms": ["exclusive license", "perpetual", "irrevocable"],
-                "infringement": ["indemnify", "defend", "infringement claims"]
-            }
-        },
-        "Force Majeure": {
-            "keywords": ["force majeure", "act of god", "unforeseeable circumstances"],
-            "base_risk": "LOW",
-            "risk_factors": {
-                "broad_definition": ["including but not limited to", "any cause"],
-                "notice_requirements": ["immediate notice", "written notice"]
-            }
-        },
-        "Data Protection": {
-            "keywords": ["personal data", "gdpr", "privacy", "data protection"],
-            "base_risk": "HIGH",
-            "risk_factors": {
-                "regulatory_compliance": ["gdpr", "ccpa", "hipaa"],
-                "breach_notification": ["data breach", "security incident"],
-                "international_transfer": ["cross-border", "international transfer"]
             }
         }
     }
 
-    def _calculate_clause_confidence(self, text: str, keywords: List[str], risk_factors: Dict[str, List[str]]) -> float:
-        """Calculate confidence based on keyword density and context"""
-        text_lower = text.lower()
-        keyword_matches = sum(1 for kw in keywords if kw in text_lower)
-        base_confidence = min(0.9, 0.3 + (keyword_matches * 0.15))
-        risk_factor_boost = 0
-        for factor_type, factors in risk_factors.items():
-            factor_matches = sum(1 for factor in factors if factor in text_lower)
-            if factor_matches > 0:
-                risk_factor_boost += 0.1 * factor_matches
-        final_confidence = min(0.95, base_confidence + risk_factor_boost)
-        return round(final_confidence, 3)
+    def __init__(self, model_name: str = CPUConfig.MODEL_NAME, knowledge_base_path: Optional[str] = None):
+        """Initialize the analyzer with optional knowledge base"""
+        self.model_name = model_name
+        self.knowledge_base_path = knowledge_base_path
+        self.model = None
+        self.knowledge_entries = []
+        self.embeddings = None
+        self.faiss_index = None
+        
+        # Initialize the sentence transformer model
+        try:
+            self.model = SentenceTransformer(self.model_name, device="cpu")
+            logger.info(f"Loaded SentenceTransformer model: {self.model_name}")
+        except Exception as e:
+            logger.warning(f"Failed to load SentenceTransformer: {e}")
+            self.model = None
+        
+        # Load knowledge base if provided and exists
+        if knowledge_base_path and Path(knowledge_base_path).exists():
+            try:
+                self.knowledge_entries, self.embeddings, self.faiss_index = CPUSafeLegalKnowledgeBase.load_cache(knowledge_base_path)
+                logger.info(f"Loaded knowledge base from {knowledge_base_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load knowledge base: {e}")
+                self.knowledge_entries = []
+                self.embeddings = None
+                self.faiss_index = None
+        else:
+            logger.info("No knowledge base provided or path doesn't exist - running without RAG")
 
-    def _assess_clause_risk(self, text: str, clause_type: str, clause_info: Dict[str, Any]) -> str:
-        """Assess actual risk level based on clause content and context"""
-        text_lower = text.lower()
-        base_risk = clause_info["base_risk"]
-        risk_factors = clause_info.get("risk_factors", {})
-        escalation_score = 0
-        mitigation_score = 0
-        for factor_type, factors in risk_factors.items():
-            for factor in factors:
-                if factor in text_lower:
-                    if factor_type in ["unlimited_liability", "broad_assignment", "immediate_termination", "penalty_terms"]:
-                        escalation_score += 2
-                    elif factor_type in ["broad_scope", "exclusive_venue", "late_fees"]:
-                        escalation_score += 1
-                    elif factor_type in ["caps", "exclusions", "notice_period"]:
-                        mitigation_score += 1
-        if clause_type == "Liability":
-            if any(phrase in text_lower for phrase in ["unlimited", "no limitation", "entire liability"]):
-                escalation_score += 3
-            elif any(phrase in text_lower for phrase in ["limited to", "shall not exceed"]):
-                mitigation_score += 2
-        elif clause_type == "Termination":
-            if any(phrase in text_lower for phrase in ["without cause", "at will", "immediate"]):
-                escalation_score += 2
-            elif any(phrase in text_lower for phrase in ["reasonable notice", "30 days notice"]):
-                mitigation_score += 1
-        elif clause_type == "IP":
-            if any(phrase in text_lower for phrase in ["work for hire", "assign all rights"]):
-                escalation_score += 3
-            elif "license" in text_lower and "revocable" in text_lower:
-                mitigation_score += 1
-        net_score = escalation_score - mitigation_score
-        if base_risk == "LOW":
-            if net_score >= 3:
-                return "HIGH"
-            elif net_score >= 1:
-                return "MEDIUM"
-            return "LOW"
-        elif base_risk == "MEDIUM":
-            if net_score >= 2:
-                return "HIGH"
-            elif net_score <= -2:
-                return "LOW"
-            return "MEDIUM"
-        else:  # HIGH
-            if net_score <= -3:
-                return "MEDIUM"
-            elif net_score <= -1:
-                return "MEDIUM"
-            return "HIGH"
+    def _retrieve_legal_context(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+        """Retrieve relevant legal context if knowledge base is available"""
+        if not self.model or not self.faiss_index or not self.knowledge_entries:
+            return {
+                "status": "no_kb",
+                "message": "No knowledge base available",
+                "retrieved_docs": []
+            }
+        
+        try:
+            # Encode query
+            query_embedding = self.model.encode([query], normalize_embeddings=True).astype("float32")
+            
+            # Search
+            scores, indices = self.faiss_index.search(query_embedding, min(top_k, len(self.knowledge_entries)))
+            
+            retrieved_docs = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx >= 0 and idx < len(self.knowledge_entries):
+                    doc = self.knowledge_entries[idx]
+                    retrieved_docs.append({
+                        "text": doc.get("text", "")[:200] + "...",
+                        "score": float(score),
+                        "id": doc.get("id", idx)
+                    })
+            
+            return {
+                "status": "success",
+                "message": f"Retrieved {len(retrieved_docs)} relevant documents",
+                "retrieved_docs": retrieved_docs
+            }
+        except Exception as e:
+            logger.warning(f"RAG retrieval failed: {e}")
+            return {
+                "status": "error",
+                "message": f"Retrieval failed: {str(e)}",
+                "retrieved_docs": []
+            }
+
+    def _extract_entities(self, text: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Extract named entities from text"""
+        entities = {
+            "ORGANIZATION": [],
+            "PERSON": [],
+            "DATE": [],
+            "MONEY": [],
+            "LOCATION": []
+        }
+        
+        # Organizations (simple pattern)
+        org_pattern = r'\b([A-Z][a-zA-Z\s&,\.]{2,50}(?:Inc|LLC|Corp|Company|Ltd|Co\.))\b'
+        for match in re.finditer(org_pattern, text):
+            entities["ORGANIZATION"].append({
+                "text": match.group(1),
+                "confidence": 0.7
+            })
+        
+        # Dates (simple pattern)
+        date_pattern = r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\w+ \d{1,2}, \d{4})\b'
+        for match in re.finditer(date_pattern, text):
+            entities["DATE"].append({
+                "text": match.group(1),
+                "confidence": 0.8
+            })
+        
+        # Money (simple pattern)
+        money_pattern = r'\$[\d,]+(?:\.\d{2})?'
+        for match in re.finditer(money_pattern, text):
+            entities["MONEY"].append({
+                "text": match.group(0),
+                "confidence": 0.9
+            })
+        
+        return entities
 
     def _get_recommendations(self, clause_type: str, risk_level: str) -> List[str]:
         """Get recommendations based on clause type and risk level"""
         recommendations = {
+            "Payment": {
+                "HIGH": ["Consider negotiating longer payment terms", "Review penalty clauses carefully"],
+                "MEDIUM": ["Ensure payment terms are clearly defined", "Consider adding dispute resolution process"],
+                "LOW": ["Standard payment terms appear reasonable"]
+            },
             "Termination": {
-                "HIGH": ["Review termination conditions", "Negotiate notice periods", "Consider mutual termination clauses"],
-                "MEDIUM": ["Clarify termination procedures", "Define reasonable notice"],
-                "LOW": ["Standard termination provisions acceptable"]
+                "HIGH": ["Negotiate longer notice periods", "Add specific breach definitions"],
+                "MEDIUM": ["Review termination conditions", "Consider mutual termination clauses"],
+                "LOW": ["Termination terms appear balanced"]
             },
             "Liability": {
-                "HIGH": ["Negotiate liability caps", "Add mutual indemnification", "Review insurance requirements"],
-                "MEDIUM": ["Consider liability limitations", "Review indemnification scope"],
-                "LOW": ["Standard liability terms acceptable"]
-            },
-            "IP": {
-                "HIGH": ["Limit IP assignment scope", "Negotiate licensing terms", "Protect background IP"],
-                "MEDIUM": ["Clarify IP ownership", "Review licensing grants"],
-                "LOW": ["Standard IP provisions acceptable"]
-            },
-            "Payment": {
-                "HIGH": ["Negotiate payment terms", "Add late fee protections", "Consider escrow arrangements"],
-                "MEDIUM": ["Clarify payment schedules", "Review currency terms"],
-                "LOW": ["Standard payment terms acceptable"]
+                "HIGH": ["Strongly consider liability caps", "Review insurance requirements"],
+                "MEDIUM": ["Clarify liability scope", "Consider mutual liability limitations"],
+                "LOW": ["Liability terms appear reasonable"]
             },
             "Confidentiality": {
-                "HIGH": ["Limit confidentiality scope", "Add mutual obligations", "Define exceptions clearly"],
-                "MEDIUM": ["Clarify confidential information definition", "Review term duration"],
-                "LOW": ["Standard confidentiality terms acceptable"]
+                "HIGH": ["Review scope of confidential information", "Consider time limitations"],
+                "MEDIUM": ["Ensure mutual confidentiality obligations", "Clarify permitted disclosures"],
+                "LOW": ["Confidentiality terms appear standard"]
+            },
+            "Intellectual Property": {
+                "HIGH": ["Carefully review IP ownership terms", "Consider retaining background IP rights"],
+                "MEDIUM": ["Clarify IP ownership and licensing", "Review work-for-hire provisions"],
+                "LOW": ["IP terms appear reasonable"]
+            },
+            "Governing Law": {
+                "HIGH": ["Consider jurisdiction implications", "Review dispute resolution mechanisms"],
+                "MEDIUM": ["Ensure chosen jurisdiction is appropriate", "Consider arbitration clauses"],
+                "LOW": ["Governing law terms appear standard"]
             }
         }
+        
         return recommendations.get(clause_type, {}).get(risk_level, ["Review clause carefully"])
 
-    def __init__(self, knowledge_base_path: Union[str, Path] = "legal_knowledge_base"):
-        self.knowledge_base_path = Path(knowledge_base_path)
-        self.model_name = CPUConfig.MODEL_NAME
-        self.model = SentenceTransformer(self.model_name, device="cpu")
-        self.knowledge_entries: List[Dict[str, Any]] = []
-        self.embeddings: Optional[np.ndarray] = None
-        self.faiss_index: Optional[faiss.Index] = None
-        try:
-            self.ner = pipeline(
-                "ner",
-                model="dbmdz/bert-large-cased-finetuned-conll03-english",
-                aggregation_strategy="simple",
-                device=-1,  # CPU
-            )
-        except Exception as e:
-            logger.warning(f"NER model failed to load; continuing without NER: {e}")
-            self.ner = None
-        self._load_kb_if_available()
-
-    def _load_kb_if_available(self) -> None:
-        try:
-            entries, embeddings, index = CPUSafeLegalKnowledgeBase.load_cache(self.knowledge_base_path)
-            self.knowledge_entries = entries
-            self.embeddings = embeddings
-            self.faiss_index = index
-            logger.info(f"KB loaded: {len(self.knowledge_entries)} entries.")
-        except FileNotFoundError:
-            logger.warning(
-                f"Knowledge base not found at {self.knowledge_base_path}. "
-                f"RAG will run with empty KB."
-            )
-        except Exception as e:
-            logger.error(f"Failed to load KB from {self.knowledge_base_path}: {e}")
-
-    def _encode_query(self, text: str) -> np.ndarray:
-        emb = self.model.encode(
-            [text],
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-        ).astype("float32")
-        return emb
-
-    def _retrieve_legal_context(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        if self.faiss_index is None or self.embeddings is None or len(self.knowledge_entries) == 0:
-            return []
-        q_emb = self._encode_query(query)
-        scores, idx = self.faiss_index.search(q_emb, min(top_k, self.embeddings.shape[0]))
-        scores = scores[0]
-        idx = idx[0]
-        results: List[Dict[str, Any]] = []
-        for rank, (i, s) in enumerate(zip(idx, scores), 1):
-            if i < 0 or i >= len(self.knowledge_entries):
-                continue
-            entry = self.knowledge_entries[i]
-            results.append(
-                {
-                    "rank": rank,
-                    "kb_id": entry.get("id", i),
-                    "text": entry.get("text", ""),
-                    "relevance_score": float(s),
-                }
-            )
-        return results
-
-    @staticmethod
-    def _simple_clause_tagging(text: str) -> List[Dict[str, Any]]:
-        """Enhanced clause tagging with proper risk assessment"""
-        analyzer = CPUSafeRAGLegalAnalyzer()
-        found: List[Dict[str, Any]] = []
+    def _assess_clause_risk(self, text: str, clause_type: str, clause_info: Dict[str, Any]) -> str:
+        """Simplified and more effective risk assessment"""
         text_lower = text.lower()
-        sentences = re.split(r'[.!?]+', text)
-        for clause_type, clause_info in analyzer.CLAUSE_PATTERNS.items():
+        base_risk = clause_info["base_risk"]
+        
+        # Count risk-increasing factors
+        high_risk_indicators = 0
+        low_risk_indicators = 0
+        
+        # Define high-risk terms that should escalate risk
+        high_risk_terms = {
+            "Payment": ["penalty", "late fee", "interest", "immediate", "upon receipt", "forfeit"],
+            "Termination": ["immediate", "without notice", "at will", "liquidated damages", "penalty"],
+            "Liability": ["unlimited", "no limitation", "full liability", "entire liability", "sole liability"],
+            "Confidentiality": ["perpetual", "all information", "any information", "injunctive relief"],
+            "Intellectual Property": ["all rights", "work for hire", "assign", "transfer", "exclusive", "perpetual"],
+            "Governing Law": ["foreign", "international", "exclusive jurisdiction"]
+        }
+        
+        # Define low-risk terms that should reduce risk
+        low_risk_terms = {
+            "Payment": ["net 30", "net 45", "reasonable time", "good faith"],
+            "Termination": ["30 days notice", "60 days notice", "reasonable notice", "material breach"],
+            "Liability": ["limited to", "shall not exceed", "cap", "maximum", "consequential damages excluded"],
+            "Confidentiality": ["reasonable", "standard", "mutual"],
+            "Intellectual Property": ["background rights", "pre-existing", "retained"],
+            "Governing Law": ["mutual consent", "arbitration"]
+        }
+        
+        # Check for high-risk indicators
+        clause_high_risk_terms = high_risk_terms.get(clause_type, [])
+        for term in clause_high_risk_terms:
+            if term in text_lower:
+                high_risk_indicators += 1
+        
+        # Check for low-risk indicators  
+        clause_low_risk_terms = low_risk_terms.get(clause_type, [])
+        for term in clause_low_risk_terms:
+            if term in text_lower:
+                low_risk_indicators += 1
+        
+        # Simple decision logic
+        net_risk = high_risk_indicators - low_risk_indicators
+        
+        # Adjust based on clause type and risk indicators
+        if clause_type in ["Liability", "Termination", "Intellectual Property"]:
+            # These are inherently higher risk clause types
+            if net_risk >= 1 or high_risk_indicators >= 2:
+                return "HIGH"
+            elif net_risk <= -1 or low_risk_indicators >= 2:
+                return "LOW"
+            else:
+                return "MEDIUM"
+        
+        elif clause_type in ["Payment", "Confidentiality"]:
+            # These are medium risk by default
+            if net_risk >= 2 or high_risk_indicators >= 3:
+                return "HIGH"
+            elif net_risk <= -1 or low_risk_indicators >= 2:
+                return "LOW"
+            else:
+                return "MEDIUM"
+        
+        else:  # Governing Law and others
+            # These are lower risk by default
+            if net_risk >= 2:
+                return "HIGH" 
+            elif net_risk >= 1:
+                return "MEDIUM"
+            else:
+                return "LOW"
+
+    def _improved_clause_detection(self, text: str) -> List[Dict[str, Any]]:
+        """Improved clause detection with better thresholds"""
+        found_clauses = []
+        text_lower = text.lower()
+        
+        print(f"DEBUG: Analyzing text of length {len(text)} characters")
+        
+        # Split text into meaningful chunks
+        chunks = []
+        
+        # Split by paragraphs first
+        paragraphs = [p.strip() for p in text.split('\n') if p.strip() and len(p.strip()) > 10]
+        if paragraphs:
+            chunks.extend(paragraphs)
+        
+        # Also split by sentences for better coverage
+        sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip() and len(s.strip()) > 10]
+        chunks.extend(sentences)
+        
+        print(f"DEBUG: Created {len(chunks)} text chunks to analyze")
+        
+        for clause_type, clause_info in self.CLAUSE_PATTERNS.items():
             keywords = clause_info["keywords"]
-            matching_sentences = []
-            for sentence in sentences:
-                if any(kw in sentence.lower() for kw in keywords):
-                    matching_sentences.append(sentence.strip())
-            if matching_sentences:
-                context_text = " ".join(matching_sentences[:3])
-                confidence = analyzer._calculate_clause_confidence(
-                    context_text, keywords, clause_info.get("risk_factors", {})
+            best_match = None
+            highest_score = 0
+            
+            print(f"DEBUG: Checking {clause_type} clause with keywords: {keywords}")
+            
+            for chunk in chunks:
+                chunk_lower = chunk.lower()
+                
+                # Count keyword matches
+                keyword_matches = sum(1 for keyword in keywords if keyword in chunk_lower)
+                
+                if keyword_matches > 0:  # At least one keyword must match
+                    # Calculate scores
+                    keyword_score = keyword_matches / len(keywords)
+                    
+                    # Check for risk factors
+                    risk_factors_found = []
+                    for factor_type, factors in clause_info.get("risk_factors", {}).items():
+                        for factor in factors:
+                            if factor in chunk_lower:
+                                risk_factors_found.append(factor)
+                    
+                    # Calculate confidence - much simpler
+                    confidence = 0.5 + (keyword_matches * 0.1) + (len(risk_factors_found) * 0.05)
+                    confidence = min(0.95, confidence)
+                    
+                    # Combined score
+                    total_score = keyword_score + (len(risk_factors_found) * 0.1)
+                    
+                    print(f"DEBUG: {clause_type} - Keywords found: {keyword_matches}, Risk factors: {len(risk_factors_found)}, Score: {total_score}")
+                    
+                    # Much lower threshold - if we find keywords, include it
+                    if total_score > 0.1 and keyword_matches >= 1:
+                        if total_score > highest_score:
+                            highest_score = total_score
+                            best_match = {
+                                "clause_type": clause_type,
+                                "confidence": round(confidence, 2),
+                                "context": chunk[:300] + "..." if len(chunk) > 300 else chunk,
+                                "keyword_matches": keyword_matches,
+                                "risk_factors_found": risk_factors_found[:3]
+                            }
+            
+            if best_match:
+                # Assess risk level
+                risk_level = self._assess_clause_risk(
+                    best_match["context"], 
+                    clause_type, 
+                    clause_info
                 )
-                risk_level = analyzer._assess_clause_risk(
-                    context_text, clause_type, clause_info
-                )
-                found.append({
-                    "clause_type": clause_type,
+                
+                print(f"DEBUG: {clause_type} clause detected with risk level: {risk_level}")
+                
+                best_match.update({
                     "risk_level": risk_level,
-                    "confidence": confidence,
-                    "context": context_text[:200] + "..." if len(context_text) > 200 else context_text,
-                    "legal_definition": f"Analysis of {clause_type} clause with {risk_level.lower()} risk assessment",
-                    "risk_factors": [
-                        factor for factor_type, factors in clause_info.get("risk_factors", {}).items()
-                        for factor in factors if factor in context_text.lower()
-                    ][:5],
-                    "recommendations": analyzer._get_recommendations(clause_type, risk_level)
+                    "risk_factors": best_match["risk_factors_found"],
+                    "recommendations": self._get_recommendations(clause_type, risk_level),
+                    "legal_definition": f"Identified {clause_type} clause with {risk_level.lower()} risk level"
                 })
-        return found
+                
+                # Clean up debug fields
+                del best_match["risk_factors_found"]
+                
+                found_clauses.append(best_match)
+        
+        print(f"DEBUG: Total clauses found: {len(found_clauses)}")
+        return found_clauses
 
-    def _extract_entities(self, text: str) -> Dict[str, List[Dict[str, Any]]]:
-        if not self.ner:
-            return {}
-        ents = self.ner(text)
-        buckets: Dict[str, List[Dict[str, Any]]] = {}
-        for e in ents:
-            label = e.get("entity_group", "MISC")
-            buckets.setdefault(label, []).append(
-                {
-                    "text": e.get("word"),
-                    "confidence": float(e.get("score", 0.0)),
-                    "start": int(e.get("start", 0)),
-                    "end": int(e.get("end", 0)),
-                }
-            )
-        return buckets
-
-    @staticmethod
-    def _risk_score(clause_analysis: List[Dict[str, Any]]) -> Tuple[int, int, int, float]:
-        """Enhanced risk scoring with LOW/MEDIUM/HIGH counts"""
-        if not clause_analysis:
-            return 0, 0, 0, 0.0
+    def _calculate_overall_risk_score(self, clause_analysis: List[Dict[str, Any]], text: str) -> Tuple[int, int, int, float]:
+        """Simplified risk scoring that actually produces varied results"""
+        
+        # Count clauses by risk level
         high = sum(1 for c in clause_analysis if c.get("risk_level") == "HIGH")
-        medium = sum(1 for c in clause_analysis if c.get("risk_level") == "MEDIUM")
+        medium = sum(1 for c in clause_analysis if c.get("risk_level") == "MEDIUM") 
         low = sum(1 for c in clause_analysis if c.get("risk_level") == "LOW")
         total_clauses = len(clause_analysis)
-        weighted_score = (high * 100 + medium * 50 + low * 10)
-        max_possible_score = total_clauses * 100
-        if max_possible_score > 0:
-            normalized_score = (weighted_score / max_possible_score) * 100
+        
+        print(f"DEBUG: Risk counts - High: {high}, Medium: {medium}, Low: {low}, Total: {total_clauses}")
+        
+        # If no clauses detected, do text-based risk assessment
+        if total_clauses == 0:
+            text_lower = text.lower()
+            risk_score = 20  # Base risk for any contract
+            
+            # Check for high-risk terms in the text
+            high_risk_keywords = ["penalty", "forfeit", "liquidated damages", "unlimited liability", 
+                                 "immediate termination", "without notice", "exclusive", "perpetual",
+                                 "all rights", "work for hire"]
+            
+            risk_terms_found = sum(1 for term in high_risk_keywords if term in text_lower)
+            risk_score += risk_terms_found * 10
+            
+            return 0, 0, 0, min(85, risk_score)
+        
+        # Calculate score based on clause risk distribution
+        if high > 0:
+            # Contracts with high-risk clauses should score 60-90
+            base_score = 60
+            base_score += high * 10  # Each high-risk clause adds 10 points
+            base_score += medium * 5  # Each medium-risk clause adds 5 points
+            base_score += low * 2    # Each low-risk clause adds 2 points
+            final_score = min(90, base_score)
+            
+        elif medium > 0:
+            # Contracts with only medium/low risk should score 30-60
+            base_score = 35
+            base_score += medium * 8  # Each medium-risk clause adds 8 points
+            base_score += low * 3     # Each low-risk clause adds 3 points
+            final_score = min(65, base_score)
+            
         else:
-            normalized_score = 0.0
-        return high, medium, low, round(normalized_score, 1)
+            # Contracts with only low-risk clauses should score 15-40
+            base_score = 20
+            base_score += low * 5     # Each low-risk clause adds 5 points
+            final_score = min(40, base_score)
+        
+        print(f"DEBUG: Final risk score: {final_score}")
+        return high, medium, low, round(final_score, 1)
 
     def analyze_contract(self, contract_text: str, analysis_id: str) -> Dict[str, Any]:
+        """Main analysis method with improved detection"""
         t0 = time.time()
+        
+        # Use improved clause detection
+        clauses = self._improved_clause_detection(contract_text)
+        
+        # RAG retrieval (if KB available)
         retrieval = self._retrieve_legal_context(contract_text, top_k=5)
-        clauses = self._simple_clause_tagging(contract_text)
+        
+        # Entity extraction
         entities = self._extract_entities(contract_text)
-        high, medium, low, overall = self._risk_score(clauses)
+        
+        # Enhanced risk scoring
+        high, medium, low, overall = self._calculate_overall_risk_score(clauses, contract_text)
+        
+        # Generate key findings
+        key_findings = []
+        if clauses:
+            key_findings.append(f"Identified {len(clauses)} legal clause types")
+            if high > 0:
+                key_findings.append(f"Found {high} high-risk clause(s) requiring attention")
+            if medium > 0:
+                key_findings.append(f"Found {medium} medium-risk clause(s) for review")
+        else:
+            key_findings.append("No specific legal clauses automatically identified")
+            key_findings.append("Manual review recommended for comprehensive analysis")
+        
         result = {
             "success": True,
             "analysis_id": analysis_id,
@@ -582,7 +632,7 @@ class CPUSafeRAGLegalAnalyzer:
                 "contract_stats": {
                     "word_count": len(contract_text.split()),
                     "char_count": len(contract_text),
-                    "section_count": 1,
+                    "paragraph_count": len([p for p in contract_text.split('\n') if p.strip()]),
                 },
                 "retrieval": retrieval,
             },
@@ -592,53 +642,45 @@ class CPUSafeRAGLegalAnalyzer:
                 "medium_risk_items": medium,
                 "low_risk_items": low,
                 "overall_risk_score": overall,
-                "key_findings": (
-                    ["No specific legal clauses identified"] if not clauses else
-                    [f"Identified {len(clauses)} clause types with varying risk levels",
-                     f"High risk: {high}, Medium risk: {medium}, Low risk: {low}"]
-                ),
+                "key_findings": key_findings,
             },
             "clause_analysis": clauses,
             "identified_entities": entities,
             "analysis_duration": time.time() - t0,
             "message": "Analysis complete",
         }
-        if wandb.run:
-            wandb.log(
-                {
-                    "sample/clauses_found": len(clauses),
-                    "sample/entities_found": sum(len(v) for v in entities.values()) if entities else 0,
-                    "sample/input_word_count": len(contract_text.split()),
-                    "kb/entries_loaded": len(self.knowledge_entries),
-                    "faiss/has_index": int(self.faiss_index is not None),
-                    "analysis/duration_sec": result["analysis_duration"],
-                }
-            )
-        logger.info(f"RAG analysis done: {analysis_id} in {result['analysis_duration']:.2f}s")
+        
+        logger.info(f"Analysis complete: {len(clauses)} clauses found, risk score: {overall}%")
         return result
 
     def cleanup(self) -> None:
-        pass
+        """Cleanup resources"""
+        if hasattr(self, 'model') and self.model:
+            del self.model
+        self.model = None
+        self.knowledge_entries = []
+        self.embeddings = None
+        self.faiss_index = None
+
 
 # ====================================================
-# (Optional) Tiny PDF text extractor — used by CLI if needed
+# (Optional) Tiny PDF text extractor
 # ====================================================
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """
-    Minimal PDF text extraction using PyPDF2 when available.
-    """
-    try:
-        import PyPDF2
-    except Exception:
-        logger.warning("PyPDF2 not installed; cannot parse PDF.")
-        return ""
-    text = ""
-    reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-    for i, page in enumerate(reader.pages):
+    """Extract text from PDF bytes"""
+    if PyPDF2 is None:
+        raise ImportError("PyPDF2 not available")
+    
+    text_parts = []
+    pdf_file = io.BytesIO(pdf_bytes)
+    reader = PyPDF2.PdfReader(pdf_file)
+    
+    for page in reader.pages:
         try:
-            page_text = page.extract_text() or ""
-            if page_text:
-                text += f"\n--- Page {i+1} ---\n{page_text}"
+            page_text = page.extract_text()
+            if page_text and page_text.strip():
+                text_parts.append(page_text.strip())
         except Exception:
             continue
-    return text.strip()
+    
+    return "\n\n".join(text_parts)
